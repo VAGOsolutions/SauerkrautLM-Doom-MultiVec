@@ -54,6 +54,7 @@ def setup_doom(scenario='basic', visible=True):
         'health_gathering': vizdoom.scenarios_path + '/health_gathering.cfg',
         'deadly_corridor': vizdoom.scenarios_path + '/deadly_corridor.cfg',
         'my_way_home': vizdoom.scenarios_path + '/my_way_home.cfg',
+        'deathmatch': vizdoom.scenarios_path + '/deathmatch.cfg',
     }
     cfg_path = scenarios.get(scenario, scenario)
     game.load_config(cfg_path)
