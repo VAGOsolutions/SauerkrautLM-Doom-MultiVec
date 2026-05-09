@@ -43,7 +43,7 @@ ACTION_TO_BUTTONS_6 = {
 }
 
 
-def setup_doom(scenario='basic', visible=True):
+def setup_doom(scenario='basic', visible=True, armed=False):
     """Set up VizDoom with visible window."""
     game = vizdoom.DoomGame()
 
@@ -211,6 +211,8 @@ def main():
                         help='Disable composite actions (only single action per step)')
     parser.add_argument('--fps', type=int, default=30,
                         help='Target frames per second (30=real-time, 60=fast, 10=slow-mo)')
+    parser.add_argument('--armed', action='store_true',
+                        help='Start with plasma rifle, armor, and full ammo (for deathmatch)')
     args = parser.parse_args()
 
     print("Loading model...")
@@ -218,7 +220,9 @@ def main():
     print(f"Model: {sum(p.numel() for p in model.parameters()):,} params")
 
     print(f"\nStarting DOOM ({args.scenario})...")
-    game = setup_doom(args.scenario, visible=True)
+    if args.armed:
+        print("Armed mode: Starting with plasma rifle, ammo, and armor")
+    game = setup_doom(args.scenario, visible=True, armed=args.armed)
     converter = AsciiConverter(width=40, height=25)
     num_actions = len([p for p in model.parameters()])  # just need count
     # Detect from model
@@ -232,10 +236,36 @@ def main():
 
     for episode in range(args.episodes):
         game.new_episode()
+
+        # Give starting weapons and ammo after each episode reset
+        # Get ammo to 600 via backpack and tics
+        if args.armed:
+            # Wait for player to fully spawn (several tics)
+            for _ in range(5):
+                game.advance_action(1)
+            # Give backpack FIRST to increase ammo capacity
+            game.send_game_command("give Backpack")
+            for _ in range(3):
+                game.advance_action(1)
+            # Now give weapons and ammo (multiple cell packs to reach ~600)
+            game.send_game_command("give PlasmaRifle")
+            for _ in range(6):
+                game.send_game_command("give CellPack")
+                game.advance_action(1)
+            game.send_game_command("give BlueArmor")
+            game.send_game_command("use PlasmaRifle")
+            game.advance_action(1)
+
+
+
         step = 0
         total_reward = 0
         action_counter = Counter()
         latencies = []
+
+        # Track kills and enemy types killed this episode
+        kills_start = game.get_game_variable(vizdoom.GameVariable.KILLCOUNT)
+        enemy_kills = Counter()  # Track kills by reward amount (maps to enemy type)
 
         print(f"\n{'='*60}")
         print(f"Episode {episode + 1}/{args.episodes}")
@@ -262,6 +292,11 @@ def main():
 
             reward = game.make_action(buttons, args.frame_skip)
             total_reward += reward
+
+            # Track enemy kills by reward value (different enemies give different rewards)
+            if reward > 0:
+                enemy_kills[reward] += 1
+
             action_counter[action_name] += 1
             step += 1
 
@@ -277,11 +312,25 @@ def main():
             if elapsed < frame_interval:
                 time.sleep(frame_interval - elapsed)
 
+        # Calculate kills this episode
+        kills_end = game.get_game_variable(vizdoom.GameVariable.KILLCOUNT)
+        kills_this_episode = int(kills_end) - int(kills_start)
+
         # Episode summary
         print(f"\n  --- Episode {episode + 1} Summary ---")
         print(f"  Steps: {step}")
         print(f"  Total reward: {total_reward:.0f}")
+        print(f"  Kills: {kills_this_episode}")
         print(f"  Avg latency: {np.mean(latencies):.0f}ms")
+
+        # Print enemy kill table
+        if enemy_kills:
+            print(f"  Enemies killed:")
+            for reward in sorted(enemy_kills.keys()):
+                count = enemy_kills[reward]
+                enemy_name = f"enemy_{int(reward)}"
+                print(f"    {enemy_name:15s}: {count:3d} kills")
+
         print(f"  Actions:")
         for action, count in action_counter.most_common():
             pct = count / step * 100 if step > 0 else 0
