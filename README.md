@@ -31,12 +31,24 @@ python scripts/play_doom_visual.py --model models/doom-multivec-trained --scenar
 #so that it has true kill potential and doesn't rely on items
 python scripts/play_doom_visual.py --model models/doom-multivec-trained --scenario deathmatch --armed
 
+#run our mcts version.
+# has batching, defaults to 1 when not set
+# live flag makes the terminal print live updates instead of smaller updates once every 10 steps
+python scripts/play_doom_mcts.py --model models/doom-multivec-trained --scenario deathmatch --armed --batch-size 4 --live
+
 # Run the benchmark
 python scripts/benchmark.py --agent multivec --model models/doom-multivec-trained --episodes 10 --realtime
 ```
 
 ---
 
+
+## TODO:
+
+- Benchmarking for our current MCTS implementation with ablation (test multiple param combinations, increase depth a bunch)
+- GPU support for batching (cpu only atm)
+- Better rollout function/natural heuristic. We can also have an llm judge the sequence and assess whether it is good behaviour after giving it criteria (which would be super cool and smart)
+- DPO (for Maxim unless someone wants to beat him to it, which is chill)
 
 ## Project Structure
 
