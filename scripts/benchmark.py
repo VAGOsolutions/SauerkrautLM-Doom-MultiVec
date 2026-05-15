@@ -147,15 +147,16 @@ class MultiVecAgent:
         self.model.load_state_dict(state)
         self.model.eval()
         self.converter = AsciiConverter(width=40, height=25)
+        self.depth_bins = getattr(self.model.encoder.config, 'depth_bins', 0)
         self.name = f"MultiVec-{sum(p.numel() for p in self.model.parameters())/1e6:.1f}M"
 
     def get_action(self, screen, depth):
         import torch
         gray = np.mean(screen, axis=2).astype(np.uint8) if screen.ndim == 3 else screen
 
-        if depth is not None:
+        if depth is not None and self.depth_bins > 0:
             ascii_text, depth_bins = self.converter.convert_with_depth(
-                gray, depth.astype(np.float32), num_bins=16
+                gray, depth.astype(np.float32), num_bins=self.depth_bins
             )
         else:
             ascii_text = self.converter.convert_simple(gray)
@@ -165,7 +166,7 @@ class MultiVecAgent:
                                 padding='max_length', truncation=True)
         depth_ids = None
         if depth_bins is not None:
-            no_depth = 16
+            no_depth = self.depth_bins
             d = [no_depth]
             for k in range(min(len(depth_bins), encoded['input_ids'].shape[1] - 2)):
                 d.append(depth_bins[k])

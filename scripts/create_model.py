@@ -60,6 +60,10 @@ def main():
                         help="FFN intermediate size (default: 512)")
     parser.add_argument("--hash_projections", type=int, default=16,
                         help="Hash embedding projections (default: 16)")
+    parser.add_argument("--depth_bins", type=int, default=16,
+                        help="Number of depth quantization bins. 0 disables the "
+                             "depth embedding entirely. Must match the bin count "
+                             "used to build the training dataset (default: 16).")
     parser.add_argument("--max_position_embeddings", type=int, default=1536,
                         help="Maximum sequence length (default: 1536)")
     parser.add_argument("--local_attention", type=int, default=128,
@@ -133,6 +137,9 @@ def main():
     # Store hash projection count in config for trust_remote_code loading
     config.hash_projections = args.hash_projections
 
+    # Without this, ModernBertHashModel defaults depth_bins=0 and silently drops depth_ids at forward.
+    config.depth_bins = args.depth_bins
+
     # auto_map so AutoModel.from_pretrained uses our custom class
     config.auto_map = {
         "AutoModel": "modeling_doom_hash.ModernBertHashModel",
@@ -144,6 +151,7 @@ def main():
     print(f"    Heads:            {args.num_heads} (head_dim={args.hidden_size // args.num_heads})")
     print(f"    Intermediate:     {args.intermediate_size}")
     print(f"    Hash Projections: {args.hash_projections}")
+    print(f"    Depth Bins:       {args.depth_bins}{' (disabled)' if args.depth_bins == 0 else ''}")
     print(f"    Max Positions:    {args.max_position_embeddings}")
     print(f"    Local Attention:  {args.local_attention}")
     print(f"    Global every N:   {args.global_attn_every_n_layers}")
@@ -220,6 +228,7 @@ def main():
             "num_attention_heads": args.num_heads,
             "intermediate_size": args.intermediate_size,
             "hash_projections": args.hash_projections,
+            "depth_bins": args.depth_bins,
             "max_position_embeddings": args.max_position_embeddings,
             "local_attention": args.local_attention,
             "global_attn_every_n_layers": args.global_attn_every_n_layers,

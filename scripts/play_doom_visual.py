@@ -113,11 +113,14 @@ def load_model(model_path, device='cpu'):
 
 
 def frame_to_action(model, tokenizer, converter, screen, depth, device='cpu',
-                    top_k=2, depth_bins=16):
+                    top_k=2, depth_bins=None):
     """Predict action from game frame with depth.
 
     Returns the top action name, button vector, and all probabilities.
     """
+    if depth_bins is None:
+        depth_bins = getattr(model.encoder.config, 'depth_bins', 0)
+
     # Convert to grayscale
     if screen.ndim == 3:
         gray = np.mean(screen, axis=2).astype(np.uint8)
@@ -125,7 +128,7 @@ def frame_to_action(model, tokenizer, converter, screen, depth, device='cpu',
         gray = screen
 
     # ASCII + depth bins
-    if depth is not None:
+    if depth is not None and depth_bins > 0:
         ascii_frame, depth_bins_list = converter.convert_with_depth(
             gray, depth.astype(np.float32), num_bins=depth_bins
         )
