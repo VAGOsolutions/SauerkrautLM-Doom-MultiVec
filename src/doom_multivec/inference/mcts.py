@@ -242,6 +242,7 @@ class MCTSAgent:
         temp_dir: Directory for temporary save files (default: system temp)
         batch_size: Number of parallel simulations to run (default: 1, sequential)
         use_puct: If True, use PUCT formula with model priors; if False, use standard UCB1 (default: True)
+        rollout_temperature: Temperature for action sampling during rollouts. Lower=more greedy, Higher=more random (default: 1.0)
     """
 
     ACTION_NAMES = ['shoot', 'move_forward', 'turn_left', 'turn_right']
@@ -265,6 +266,7 @@ class MCTSAgent:
         temp_dir: Optional[str] = None,
         batch_size: int = 1,
         use_puct: bool = True,
+        rollout_temperature: float = 0.1,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -276,6 +278,7 @@ class MCTSAgent:
         self.device = device
         self.batch_size = batch_size
         self.use_puct = use_puct
+        self.rollout_temperature = rollout_temperature
         self.temp_dir = temp_dir or tempfile.gettempdir()
         self._save_counter = 0
 
@@ -391,6 +394,54 @@ class MCTSAgent:
 
         return input_ids, attention_mask, depth_ids
 
+    def _sample_action_from_current_state(self) -> int:
+        """Get current game state, evaluate model, and sample an action.
+
+        Returns:
+            Action index sampled from model's probability distribution
+        """
+        state_obj = self.current_game.get_state()
+        if state_obj is None:
+            return np.random.randint(self.num_actions)
+
+        screen = state_obj.screen_buffer
+        depth = state_obj.depth_buffer if hasattr(state_obj, 'depth_buffer') else None
+
+        # Convert to ASCII
+        if screen.ndim == 3:
+            gray = np.mean(screen, axis=2).astype(np.uint8)
+        else:
+            gray = screen
+
+        if depth is not None:
+            ascii_frame, depth_bins = self.converter.convert_with_depth(
+                gray, depth.astype(np.float32), num_bins=16
+            )
+        else:
+            ascii_frame = self.converter.convert_simple(gray)
+            depth_bins = None
+
+        # Create temporary state for model evaluation
+        rollout_state = GameState(
+            ascii_frame=ascii_frame,
+            depth_bins=depth_bins,
+            health=self.current_game.get_game_variable(__import__('vizdoom').GameVariable.HEALTH),
+            armor=self.current_game.get_game_variable(__import__('vizdoom').GameVariable.ARMOR),
+            game_reward=float(self.current_game.get_game_variable(__import__('vizdoom').GameVariable.KILLCOUNT)),
+        )
+
+        # Get model priors for action selection
+        input_ids, attention_mask, depth_ids = self._prepare_model_input(rollout_state)
+        action_probs = self._evaluate_state(input_ids, attention_mask, depth_ids)
+
+        # Apply temperature scaling to control exploration during rollout
+        if self.rollout_temperature != 1.0:
+            action_probs = np.power(action_probs, 1.0 / self.rollout_temperature)
+            action_probs = action_probs / action_probs.sum()
+
+        # Sample action from model distribution
+        return np.random.choice(self.num_actions, p=action_probs)
+
     def _select(self, node: MCTSNode) -> MCTSNode:
         """Selection: traverse tree using UCB1 or PUCT until reaching unexpanded node."""
         while node.is_fully_expanded() and node.children:
@@ -442,7 +493,7 @@ class MCTSAgent:
         return child
 
     def _rollout(self, node: MCTSNode) -> float:
-        """Rollout: simulate random actions and return binary win/lose.
+        """Rollout: simulate actions using model priors and return binary win/lose.
 
         Win: Game reward increased during rollout
         Lose: Health OR armor decreased with no game reward increase
@@ -465,13 +516,14 @@ class MCTSAgent:
             vizdoom.GameVariable.KILLCOUNT
         )
 
-        # Simulate random actions
+        # Simulate actions guided by model
         for _ in range(self.rollout_depth):
             if self.current_game.is_episode_finished():
                 break
 
-            # Random action
-            action = np.random.randint(self.num_actions)
+            # Get action from model and execute it
+            action = self._sample_action_from_current_state()
+            logging.debug(f"Rollout action: {self.ACTION_NAMES[action]} (index {action})")
             action_name = self.ACTION_NAMES[action]
             buttons = self.ACTION_TO_BUTTONS[action_name]
             self.current_game.make_action(buttons, 4)
@@ -487,17 +539,11 @@ class MCTSAgent:
             vizdoom.GameVariable.KILLCOUNT
         )
 
-        reward_increased = end_kills > start_kills
-        health_decreased = end_health < start_health
-        armor_decreased = end_armor < start_armor
+        kill_reward = np.sign(end_kills - start_kills)
+        health_reward = np.sign(end_health - start_health)
+        armor_reward = np.sign(end_armor - start_armor)
 
-        if reward_increased:
-            return 1.0  # Win
-        elif health_decreased or armor_decreased:
-            return 0.0  # Lose (health or armor decreased)
-        else:
-            # Neutral - no change in reward, health, or armor
-            return 0.5
+        return kill_reward + 2 * health_reward + 2 * armor_reward
 
     def _backpropagate(self, node: MCTSNode, value: float) -> None:
         """Backpropagation: update statistics up the tree."""

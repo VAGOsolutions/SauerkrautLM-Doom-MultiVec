@@ -380,6 +380,10 @@ def main():
                         help='Live mode: continuous display with steps/minute')
     parser.add_argument('--batch-size', type=int, default=1,
                         help='Batch size for parallel MCTS simulations (default: 1)')
+    parser.add_argument('--use-ucb', action='store_true',
+                        help='Use UCB1 instead of PUCT for tree search (default: PUCT)')
+    parser.add_argument('--rollout-temperature', type=float, default=0.1,
+                        help='Temperature for action sampling during rollouts (default: 0.1)')
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -393,6 +397,7 @@ def main():
 
     print(f"\nStarting DOOM ({args.scenario})...")
     print(f"MCTS config: {args.simulations} simulations, {args.depth} frame depth, c={args.c}, batch={args.batch_size}")
+    print(f"Algorithm: {'UCB1' if args.use_ucb else 'PUCT'}, rollout_temperature={args.rollout_temperature}")
     if args.live:
         print("Mode: LIVE (continuous display, steps/minute)")
     if args.armed:
@@ -412,6 +417,8 @@ def main():
         num_actions=num_actions,
         device='cpu',
         batch_size=args.batch_size,
+        use_puct=not args.use_ucb,
+        rollout_temperature=args.rollout_temperature,
     )
     agent.set_game(game)
 
