@@ -22,6 +22,9 @@ from typing import List
 
 import numpy as np
 import torch
+import logging
+
+# logging.basicConfig(level=logging.DEBUG)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
