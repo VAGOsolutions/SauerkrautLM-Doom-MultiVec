@@ -62,3 +62,6 @@ Thumbs.db
 
 # Keep docs video via exception
 !docs/assets/*.mp4
+
+# Secret environment variables
+.env

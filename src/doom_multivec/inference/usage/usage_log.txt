@@ -1,0 +1,2 @@
+{"timestamp": "2026-05-23T22:16:54.565986Z", "model": "api-gemma-4-26b", "prompt_tokens": 1099, "completion_tokens": 512, "total_tokens": 1611, "cost_usd": 0.00026712, "http_status": 200, "endpoint": "https://tritonai-api.ucsd.edu/v1/chat/completions"}
+{"timestamp": "2026-05-23T22:19:19.859425Z", "model": "api-gemma-4-26b", "prompt_tokens": 1099, "completion_tokens": 512, "total_tokens": 1611, "cost_usd": 0.00026712, "http_status": 200, "endpoint": "https://tritonai-api.ucsd.edu/v1/chat/completions"}

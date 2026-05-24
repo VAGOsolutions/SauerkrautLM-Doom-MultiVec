@@ -15,6 +15,7 @@ dependencies = [
     "numpy",
     "Pillow",
     "datasets",
+    "python-dotenv",
 ]
 
 [project.optional-dependencies]

@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import logging
 
-# logging.basicConfig(level=logging.DEBUG)
+#logging.basicConfig(level=logging.DEBUG)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
@@ -384,6 +384,8 @@ def main():
                         help='Use UCB1 instead of PUCT for tree search (default: PUCT)')
     parser.add_argument('--rollout-temperature', type=float, default=0.1,
                         help='Temperature for action sampling during rollouts (default: 0.1)')
+    parser.add_argument('--prior-temperature', type=float, default=0.1,
+                        help='Temperature for prior distribution modification (default: 0.1)')
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -397,7 +399,7 @@ def main():
 
     print(f"\nStarting DOOM ({args.scenario})...")
     print(f"MCTS config: {args.simulations} simulations, {args.depth} frame depth, c={args.c}, batch={args.batch_size}")
-    print(f"Algorithm: {'UCB1' if args.use_ucb else 'PUCT'}, rollout_temperature={args.rollout_temperature}")
+    print(f"Algorithm: {'UCB1' if args.use_ucb else 'PUCT'}, rollout_temperature={args.rollout_temperature}, prior_temperature={args.prior_temperature}")
     if args.live:
         print("Mode: LIVE (continuous display, steps/minute)")
     if args.armed:
@@ -419,6 +421,9 @@ def main():
         batch_size=args.batch_size,
         use_puct=not args.use_ucb,
         rollout_temperature=args.rollout_temperature,
+        prior_temperature=args.prior_temperature,
+        use_composite_moves=True,
+        composite_logit_weights=[50.0, 0.7, 0.8, 0.9],  # No additional weight on composite moves
     )
     agent.set_game(game)
 

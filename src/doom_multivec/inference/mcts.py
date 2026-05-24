@@ -15,10 +15,38 @@ import os
 import tempfile
 import numpy as np
 import torch
+from PIL import Image
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+from pathlib import Path
+
+
+def _save_image_index_frame(frame: Optional[np.ndarray], image_index: int) -> Optional[str]:
+    """Save a node frame to `test/image{image_index}.png`.
+
+    This is used by `_select` and `_rollout` so the captured path is
+    numbered consistently across the whole simulation.
+    """
+    if frame is None:
+        return None
+
+    image_dir = Path(__file__).resolve().parent / "test"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    image_path = image_dir / f"image{image_index}.png"
+
+    array = np.asarray(frame)
+    if array.ndim == 2:
+        image = Image.fromarray(array.astype(np.uint8), mode="L")
+    elif array.ndim == 3 and array.shape[2] == 3:
+        image = Image.fromarray(array.astype(np.uint8), mode="RGB")
+    elif array.ndim == 3 and array.shape[2] == 4:
+        image = Image.fromarray(array.astype(np.uint8), mode="RGBA")
+    else:
+        image = Image.fromarray(array.astype(np.uint8))
+    image.save(image_path)
+    return str(image_path)
 
 @dataclass
 class GameState:
@@ -28,6 +56,7 @@ class GameState:
     health: float
     armor: float
     game_reward: float  # Cumulative game reward at this state
+    frame: Optional[np.ndarray] = None
 
 
 class MCTSNode:
@@ -99,21 +128,19 @@ class MCTSNode:
 
         best_score = -float('inf')
         best_child = None
+        
 
         for action, child in self.children.items():
-            if child.visits == 0:
-                # Prioritize unvisited children
-                score = float('inf')
+            epsilon = 1e-5  # Small constant to prevent division by zero
+            exploitation = child.total_value / (child.visits + epsilon)
+            if use_puct:
+                # PUCT formula with model priors
+                prior = self.model_priors[action] if self.model_priors is not None else 1.0 / self.num_actions
+                exploration = c * prior * math.sqrt(self.visits) / (1.0 + child.visits)
             else:
-                exploitation = child.total_value / child.visits
-                if use_puct:
-                    # PUCT formula with model priors
-                    prior = self.model_priors[action] if self.model_priors is not None else 1.0 / self.num_actions
-                    exploration = c * prior * math.sqrt(self.visits) / (1.0 + child.visits)
-                else:
-                    # Standard UCB1 formula
-                    exploration = c * math.sqrt(math.log(self.visits) / child.visits)
-                score = exploitation + exploration
+                # Standard UCB1 formula
+                exploration = c * math.sqrt(math.log(self.visits) / (child.visits + epsilon))
+            score = exploitation + exploration
 
             if score > best_score:
                 best_score = score
@@ -141,16 +168,14 @@ class MCTSNode:
         for action, child in self.children.items():
             if exclude_pending and child.is_expanding:
                 continue
-            if child.visits == 0:
-                score = float('inf')
+            epsilon = 1e-5  # Small constant to prevent division by zero
+            exploitation = child.total_value / (child.visits + epsilon)
+            if use_puct:
+                prior = self.model_priors[action] if self.model_priors is not None else 1.0 / self.num_actions
+                exploration = c * prior * math.sqrt(self.visits) / (1.0 + child.visits)
             else:
-                exploitation = child.total_value / child.visits
-                if use_puct:
-                    prior = self.model_priors[action] if self.model_priors is not None else 1.0 / self.num_actions
-                    exploration = c * prior * math.sqrt(self.visits) / (1.0 + child.visits)
-                else:
-                    exploration = c * math.sqrt(math.log(self.visits) / child.visits)
-                score = exploitation + exploration
+                exploration = c * math.sqrt(math.log(self.visits) / (child.visits + epsilon))
+            score = exploitation + exploration
 
             if score > best_score:
                 best_score = score
@@ -243,6 +268,7 @@ class MCTSAgent:
         batch_size: Number of parallel simulations to run (default: 1, sequential)
         use_puct: If True, use PUCT formula with model priors; if False, use standard UCB1 (default: True)
         rollout_temperature: Temperature for action sampling during rollouts. Lower=more greedy, Higher=more random (default: 1.0)
+        prior_temperature: Temperature for prior distribution. Lower=sharper distribution, Higher=flatter distribution (default: 0.1)
     """
 
     ACTION_NAMES = ['shoot', 'move_forward', 'turn_left', 'turn_right']
@@ -251,6 +277,15 @@ class MCTSAgent:
         'move_forward': [0, 1, 0, 0],
         'turn_left': [0, 0, 1, 0],
         'turn_right': [0, 0, 0, 1],
+    }
+    
+    # Composite moves (combinations of base actions)
+    COMPOSITE_MOVES = {
+        'move_forward+turn_left': [0, 1, 1, 0],
+        'move_forward+turn_right': [0, 1, 0, 1],
+        'move_forward+shoot': [1, 1, 0, 0],
+        'turn_left+shoot': [1, 0, 1, 0],
+        'turn_right+shoot': [1, 0, 0, 1],
     }
 
     def __init__(
@@ -267,6 +302,10 @@ class MCTSAgent:
         batch_size: int = 1,
         use_puct: bool = True,
         rollout_temperature: float = 0.1,
+        prior_temperature: float = 0.1,
+        use_composite_moves: bool = True,
+        composite_logit_weights: Optional[List[float]] = None,
+        save_images: bool = False,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -274,17 +313,49 @@ class MCTSAgent:
         self.num_simulations = num_simulations
         self.rollout_depth = rollout_depth
         self.c = exploration_constant
-        self.num_actions = num_actions
         self.device = device
         self.batch_size = batch_size
         self.use_puct = use_puct
         self.rollout_temperature = rollout_temperature
+        self.prior_temperature = prior_temperature
         self.temp_dir = temp_dir or tempfile.gettempdir()
         self._save_counter = 0
+        self.image_save_index = 0
+        self.save_images = save_images
+        self.use_composite_moves = use_composite_moves
+        self.composite_logit_weights = composite_logit_weights or [1.0, 1.0, 1.0, 1.0]
+        
+        # Build action mappings based on composite moves toggle
+        self._build_action_mappings()
+        
+        # Set num_actions based on actual action mappings
+        self.num_actions = len(self.action_names)
 
         # Root node will be set when game starts
         self.root: Optional[MCTSNode] = None
         self.current_game = None
+        # Track last loaded save path to help debugging and avoid redundant loads
+        self._last_loaded_save: Optional[str] = None
+    
+    def _build_action_mappings(self) -> None:
+        """Build action name and button mappings based on composite moves setting."""
+        self.action_names = list(self.ACTION_NAMES)
+        self.action_to_buttons = dict(self.ACTION_TO_BUTTONS)
+        
+        if self.use_composite_moves:
+            self.action_names.extend(self.COMPOSITE_MOVES.keys())
+            self.action_to_buttons.update(self.COMPOSITE_MOVES)
+            
+            # Build mapping of composite action indices to base action indices
+            self.composite_action_components = {
+                4: [1, 2],  # move_forward+turn_left
+                5: [1, 3],  # move_forward+turn_right
+                6: [0, 1],  # move_forward+shoot
+                7: [0, 2],  # turn_left+shoot
+                8: [0, 3],  # turn_right+shoot
+            }
+        else:
+            self.composite_action_components = {}
 
     def set_game(self, game) -> None:
         """Set the VizDoom game instance for state saving/loading."""
@@ -313,6 +384,7 @@ class MCTSAgent:
             raise RuntimeError("Game state is None - episode may have ended")
         screen = state.screen_buffer
         depth = state.depth_buffer if hasattr(state, 'depth_buffer') else None
+        frame = np.array(screen, copy=True)
 
         # Convert to ASCII
         if screen.ndim == 3:
@@ -342,6 +414,7 @@ class MCTSAgent:
         game_reward = float(killcount)
 
         game_state = GameState(
+            frame=frame,
             ascii_frame=ascii_frame,
             depth_bins=depth_bins,
             health=health,
@@ -356,18 +429,85 @@ class MCTSAgent:
 
     def _copy_state_for_expansion(self, node: MCTSNode) -> None:
         """Load saved state into game for expanding a node."""
-        if node.save_path is not None and os.path.exists(node.save_path):
+        if node.save_path is None:
+            logging.debug("_copy_state_for_expansion: node has no save_path")
+            return
+
+        if not os.path.exists(node.save_path):
+            logging.warning("_copy_state_for_expansion: save_path does not exist: %s", node.save_path)
+            return
+
+        try:
+            # Always attempt to load the node's save to ensure correct starting state
             self.current_game.load(node.save_path)
+            self._last_loaded_save = node.save_path
+            logging.debug("Loaded save for expansion")
+        except Exception:
+            logging.exception("Failed to load save for expansion: %s", node.save_path)
+
+    def _save_current_frame(self, frame: Optional[np.ndarray]) -> None:
+        """Save the current frame if image saving is enabled."""
+        if not self.save_images:
+            return
+
+        _save_image_index_frame(frame, self.image_save_index)
+        self.image_save_index += 1
+
+    def _compute_composite_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Expand logits to include composite moves.
+        
+        For composite actions, the logit is computed as the weighted sum of the subcomponents'
+        logits, allowing a more expressive probability distribution beyond the base 4 actions.
+        
+        Args:
+            logits: Tensor of shape (4,) with base action logits
+            
+        Returns:
+            Tensor of shape (9,) with base + composite action logits (if composite moves enabled)
+            Otherwise returns original logits padded/returned as-is
+        """
+        if not self.use_composite_moves:
+            return logits
+        
+        # Start with base action logits
+        expanded_logits = logits.clone() 
+        
+        # Compute composite action logits by applying weights and summing component logits
+        for composite_idx, component_indices in self.composite_action_components.items():
+            composite_logit = sum(self.composite_logit_weights[i] * logits[i] for i in component_indices)
+            expanded_logits = torch.cat([expanded_logits, composite_logit.unsqueeze(0)])
+        
+        return expanded_logits
 
     def _evaluate_state(self, input_ids, attention_mask, depth_ids) -> np.ndarray:
         """Get action probabilities from the model.
+
+        Applies prior_temperature to sharpen or flatten the distribution.
+        Temperature < 1.0 sharpens the distribution (more peaked).
+        Temperature > 1.0 flattens the distribution (more uniform).
+        
+        If composite moves are enabled, expands the distribution to include
+        composite actions computed from base action logits.
 
         Returns:
             Array of action probabilities
         """
         with torch.no_grad():
             result = self.model(input_ids, attention_mask, depth_ids=depth_ids)
-            probs = torch.softmax(result['logits'], dim=-1)[0].cpu().numpy()
+            logits = result['logits'][0]
+            
+            # Expand logits to include composite moves if enabled
+            logits = self._compute_composite_logits(logits)
+
+            #print dict of logits and corresponding action names for debugging
+            logit_dict = {self.action_names[i]: logits[i].item() for i in range(len(self.action_names))}
+            # logging.debug(f"Model logits: {logit_dict}")
+            
+            # Apply prior_temperature scaling
+            if self.prior_temperature != 1.0:
+                logits = logits / self.prior_temperature
+            
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()
         return probs[:self.num_actions]
 
     def _prepare_model_input(self, state: GameState):
@@ -394,15 +534,16 @@ class MCTSAgent:
 
         return input_ids, attention_mask, depth_ids
 
-    def _sample_action_from_current_state(self) -> int:
+    def _sample_action_from_current_state(self) -> Tuple[int, np.ndarray]:
         """Get current game state, evaluate model, and sample an action.
 
         Returns:
-            Action index sampled from model's probability distribution
+            Tuple of (sampled action index, action probability distribution)
         """
         state_obj = self.current_game.get_state()
         if state_obj is None:
-            return np.random.randint(self.num_actions)
+            raw_action_probs = np.ones(self.num_actions) / self.num_actions
+            return np.random.randint(self.num_actions), raw_action_probs
 
         screen = state_obj.screen_buffer
         depth = state_obj.depth_buffer if hasattr(state_obj, 'depth_buffer') else None
@@ -423,6 +564,7 @@ class MCTSAgent:
 
         # Create temporary state for model evaluation
         rollout_state = GameState(
+            frame=np.array(screen, copy=True),
             ascii_frame=ascii_frame,
             depth_bins=depth_bins,
             health=self.current_game.get_game_variable(__import__('vizdoom').GameVariable.HEALTH),
@@ -432,20 +574,24 @@ class MCTSAgent:
 
         # Get model priors for action selection
         input_ids, attention_mask, depth_ids = self._prepare_model_input(rollout_state)
-        action_probs = self._evaluate_state(input_ids, attention_mask, depth_ids)
+        raw_action_probs = self._evaluate_state(input_ids, attention_mask, depth_ids)
 
         # Apply temperature scaling to control exploration during rollout
+        action_probs = raw_action_probs.copy()
         if self.rollout_temperature != 1.0:
             action_probs = np.power(action_probs, 1.0 / self.rollout_temperature)
             action_probs = action_probs / action_probs.sum()
 
         # Sample action from model distribution
-        return np.random.choice(self.num_actions, p=action_probs)
+        action = np.random.choice(self.num_actions, p=action_probs)
+        return action, raw_action_probs
 
     def _select(self, node: MCTSNode) -> MCTSNode:
         """Selection: traverse tree using UCB1 or PUCT until reaching unexpanded node."""
+        self._save_current_frame(node.state.frame)
         while node.is_fully_expanded() and node.children:
             node = node.best_child(self.c, use_puct=self.use_puct)
+            self._save_current_frame(node.state.frame)
         return node
 
     def _expand(self, node: MCTSNode) -> MCTSNode:
@@ -467,9 +613,14 @@ class MCTSAgent:
 
         # Load parent state and take action
         self._copy_state_for_expansion(node)
-        action_name = self.ACTION_NAMES[action]
-        buttons = self.ACTION_TO_BUTTONS[action_name]
+        action_name = self.action_names[action]
+        buttons = self.action_to_buttons[action_name]
+        self.current_game.make_action([0,0,0,0], 1) 
         self.current_game.make_action(buttons, 4)
+        
+        rollout_state = self.current_game.get_state()
+        if rollout_state is not None:
+            self._save_current_frame(rollout_state.screen_buffer)
 
         # Capture new state
         child_state, save_path = self._create_state_from_game()
@@ -478,7 +629,7 @@ class MCTSAgent:
         input_ids, attention_mask, depth_ids = self._prepare_model_input(child_state)
         child_priors = self._evaluate_state(input_ids, attention_mask, depth_ids)
 
-        logging.debug(f"Expanding node with action '{action_name}' (index {action}) - model priors: {child_priors}")
+        logging.debug(f"Expand action: {action_name}")
         # Create child node with its own priors
         child = MCTSNode(
             state=child_state,
@@ -501,8 +652,26 @@ class MCTSAgent:
         Returns:
             1.0 for win, 0.0 for lose, 0.5 for neutral
         """
-        # Load node state (create a temp game copy if batching)
-        self._copy_state_for_expansion(node)
+
+        # Ensure we start the rollout from the node's saved snapshot.
+        # If the node lacks a save file, create one from the current game state.
+        if node.save_path is None or not os.path.exists(node.save_path):
+            try:
+                logging.debug("_rollout: node.save_path missing or removed; creating save from current game")
+                new_state, new_save = self._create_state_from_game()
+                node.save_path = new_save
+                logging.debug("_rollout: created save %s for node", new_save)
+            except Exception:
+                logging.exception("_rollout: failed to create save for node; proceeding without explicit load")
+
+        # Always attempt to load the node's save to guarantee correct starting state
+        if node.save_path is not None and os.path.exists(node.save_path):
+            try:
+                self.current_game.load(node.save_path)
+                self._last_loaded_save = node.save_path
+                # logging.debug("_rollout: loaded node save %s", node.save_path)
+            except Exception:
+                logging.exception("_rollout: failed to load node save %s", node.save_path)
 
         # Record starting metrics
         vizdoom = __import__('vizdoom')
@@ -516,17 +685,23 @@ class MCTSAgent:
             vizdoom.GameVariable.KILLCOUNT
         )
 
+        self.current_game.make_action([0,0,0,0], 1)
+
         # Simulate actions guided by model
         for _ in range(self.rollout_depth):
             if self.current_game.is_episode_finished():
                 break
 
             # Get action from model and execute it
-            action = self._sample_action_from_current_state()
-            logging.debug(f"Rollout action: {self.ACTION_NAMES[action]} (index {action})")
-            action_name = self.ACTION_NAMES[action]
-            buttons = self.ACTION_TO_BUTTONS[action_name]
+            action, raw_action_probs = self._sample_action_from_current_state()
+            logging.debug(f"Rollout action: {self.action_names[action]}")
+            action_name = self.action_names[action]
+            buttons = self.action_to_buttons[action_name]
             self.current_game.make_action(buttons, 4)
+
+            rollout_state = self.current_game.get_state()
+            if rollout_state is not None:
+                self._save_current_frame(rollout_state.screen_buffer)
 
         # Evaluate outcome
         end_health = self.current_game.get_game_variable(
@@ -543,7 +718,19 @@ class MCTSAgent:
         health_reward = np.sign(end_health - start_health)
         armor_reward = np.sign(end_armor - start_armor)
 
-        return kill_reward + 2 * health_reward + 2 * armor_reward
+        value = kill_reward + 2 * health_reward + 2 * armor_reward
+
+        # Restore the node's saved snapshot so the VizDoom instance remains
+        # consistent across separate rollouts/simulations.
+        try:
+            if node.save_path is not None and os.path.exists(node.save_path):
+                self.current_game.load(node.save_path)
+                self._last_loaded_save = node.save_path
+                # logging.debug("_rollout: restored node save %s after rollout", node.save_path)
+        except Exception:
+            logging.exception("_rollout: failed to restore node save %s after rollout", node.save_path)
+
+        return value
 
     def _backpropagate(self, node: MCTSNode, value: float) -> None:
         """Backpropagation: update statistics up the tree."""
@@ -557,24 +744,31 @@ class MCTSAgent:
         if self.root is None:
             raise ValueError("Root node not initialized. Call initialize_root() first.")
 
-        # Make sure to restore to root state at start of simulation
-        self._copy_state_for_expansion(self.root)
+        # Always leave simulation with root state loaded so rollout actions do
+        # not leak into live gameplay.
+        try:
+            # Make sure to restore to root state at start of simulation
+            self._copy_state_for_expansion(self.root)
+            if self.save_images:
+                self.image_save_index = 0
 
-        # Selection
-        node = self._select(self.root)
+            # Selection
+            node = self._select(self.root)
 
-        # Expansion (if not terminal)
-        if not self.current_game.is_episode_finished() and node.untried_actions:
-            node = self._expand(node)
+            # Expansion (if not terminal)
+            if not self.current_game.is_episode_finished() and node.untried_actions:
+                node = self._expand(node)
 
-        # Rollout (only if game still running)
-        if self.current_game.is_episode_finished():
-            value = 0.5  # Episode ended
-        else:
-            value = self._rollout(node)
+            # Rollout (only if game still running)
+            if self.current_game.is_episode_finished():
+                value = 0.5  # Episode ended
+            else:
+                value = self._rollout(node)
 
-        # Backpropagation
-        self._backpropagate(node, value)
+            # Backpropagation
+            self._backpropagate(node, value)
+        finally:
+            self._copy_state_for_expansion(self.root)
 
     def _run_single_leaf_eval(self, leaf_info: Tuple[MCTSNode, str, int]) -> Tuple[MCTSNode, float]:
         """Run a single leaf evaluation for batching.
@@ -591,8 +785,8 @@ class MCTSAgent:
         self.current_game.load(save_path)
 
         # Take action
-        action_name = self.ACTION_NAMES[action]
-        buttons = self.ACTION_TO_BUTTONS[action_name]
+        action_name = self.action_names[action]
+        buttons = self.action_to_buttons[action_name]
         self.current_game.make_action(buttons, 4)
 
         # Capture new state
@@ -678,8 +872,11 @@ class MCTSAgent:
                 best_visits = child.visits
                 best_action = action
 
-        action_name = self.ACTION_NAMES[best_action]
-        buttons = self.ACTION_TO_BUTTONS[action_name]
+        action_name = self.action_names[best_action]
+        buttons = self.action_to_buttons[action_name]
+
+        # Ensure caller executes chosen action from real/root game state.
+        self._copy_state_for_expansion(self.root)
 
         return action_name, buttons, best_action
 
