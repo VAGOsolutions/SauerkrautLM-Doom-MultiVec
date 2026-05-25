@@ -13,6 +13,7 @@ Batching support: run multiple leaf evaluations in parallel.
 import math
 import os
 import tempfile
+import time
 import numpy as np
 import torch
 from PIL import Image
@@ -55,6 +56,8 @@ class GameState:
     depth_bins: Optional[List[int]]
     health: float
     armor: float
+    velocity_x: float
+    velocity_y: float
     game_reward: float  # Cumulative game reward at this state
     frame: Optional[np.ndarray] = None
 
@@ -336,6 +339,18 @@ class MCTSAgent:
         self.current_game = None
         # Track last loaded save path to help debugging and avoid redundant loads
         self._last_loaded_save: Optional[str] = None
+        self._benchmark_sink: Optional[Dict[str, Dict[str, float]]] = None
+
+    def _record_benchmark(self, key: str, elapsed_seconds: float) -> None:
+        if self._benchmark_sink is None:
+            return
+
+        entry = self._benchmark_sink.setdefault(key, {
+            "total_ms": 0.0,
+            "count": 0.0,
+        })
+        entry["total_ms"] += elapsed_seconds * 1000.0
+        entry["count"] += 1.0
     
     def _build_action_mappings(self) -> None:
         """Build action name and button mappings based on composite moves setting."""
@@ -407,6 +422,12 @@ class MCTSAgent:
         armor = self.current_game.get_game_variable(
             __import__('vizdoom').GameVariable.ARMOR
         )
+        velocity_x = self.current_game.get_game_variable(
+            __import__('vizdoom').GameVariable.VELOCITY_X
+        )
+        velocity_y = self.current_game.get_game_variable(
+            __import__('vizdoom').GameVariable.VELOCITY_Y
+        )
         killcount = self.current_game.get_game_variable(
             __import__('vizdoom').GameVariable.KILLCOUNT
         )
@@ -419,6 +440,8 @@ class MCTSAgent:
             depth_bins=depth_bins,
             health=health,
             armor=armor,
+            velocity_x=velocity_x,
+            velocity_y=velocity_y,
             game_reward=game_reward,
         )
 
@@ -429,21 +452,31 @@ class MCTSAgent:
 
     def _copy_state_for_expansion(self, node: MCTSNode) -> None:
         """Load saved state into game for expanding a node."""
+        timing_start = time.perf_counter()
         if node.save_path is None:
             logging.debug("_copy_state_for_expansion: node has no save_path")
+            self._record_benchmark("copy_state", time.perf_counter() - timing_start)
             return
 
         if not os.path.exists(node.save_path):
             logging.warning("_copy_state_for_expansion: save_path does not exist: %s", node.save_path)
+            self._record_benchmark("copy_state", time.perf_counter() - timing_start)
             return
 
         try:
             # Always attempt to load the node's save to ensure correct starting state
             self.current_game.load(node.save_path)
+            
+            self.current_game.send_game_command(f"+set velx {node.state.velocity_x}")
+            self.current_game.send_game_command(f"+set vely {node.state.velocity_y}")
+            self.current_game.send_game_command(f"+forward") # Override velocity for testing purposes
+            #print(f"velocity_x: {node.state.velocity_x}, velocity_y: {node.state.velocity_y}")
             self._last_loaded_save = node.save_path
             logging.debug("Loaded save for expansion")
         except Exception:
             logging.exception("Failed to load save for expansion: %s", node.save_path)
+        finally:
+            self._record_benchmark("copy_state", time.perf_counter() - timing_start)
 
     def _save_current_frame(self, frame: Optional[np.ndarray]) -> None:
         """Save the current frame if image saving is enabled."""
@@ -569,6 +602,8 @@ class MCTSAgent:
             depth_bins=depth_bins,
             health=self.current_game.get_game_variable(__import__('vizdoom').GameVariable.HEALTH),
             armor=self.current_game.get_game_variable(__import__('vizdoom').GameVariable.ARMOR),
+            velocity_x=self.current_game.get_game_variable(__import__('vizdoom').GameVariable.VELOCITY_X),
+            velocity_y=self.current_game.get_game_variable(__import__('vizdoom').GameVariable.VELOCITY_Y),
             game_reward=float(self.current_game.get_game_variable(__import__('vizdoom').GameVariable.KILLCOUNT)),
         )
 
@@ -588,17 +623,21 @@ class MCTSAgent:
 
     def _select(self, node: MCTSNode) -> MCTSNode:
         """Selection: traverse tree using UCB1 or PUCT until reaching unexpanded node."""
+        timing_start = time.perf_counter()
         self._save_current_frame(node.state.frame)
         while node.is_fully_expanded() and node.children:
             node = node.best_child(self.c, use_puct=self.use_puct)
             self._save_current_frame(node.state.frame)
+        self._record_benchmark("select", time.perf_counter() - timing_start)
         return node
 
     def _expand(self, node: MCTSNode) -> MCTSNode:
         """Expansion: create child node for an untried action.
         Uses model priors from parent node to bias action selection.
         """
+        timing_start = time.perf_counter()
         if not node.untried_actions:
+            self._record_benchmark("expand", time.perf_counter() - timing_start)
             return node
 
         # Select untried action, preferring high-prior actions
@@ -641,6 +680,7 @@ class MCTSAgent:
         )
 
         node.children[action] = child
+        self._record_benchmark("expand", time.perf_counter() - timing_start)
         return child
 
     def _rollout(self, node: MCTSNode) -> float:
@@ -652,6 +692,7 @@ class MCTSAgent:
         Returns:
             1.0 for win, 0.0 for lose, 0.5 for neutral
         """
+        timing_start = time.perf_counter()
 
         # Ensure we start the rollout from the node's saved snapshot.
         # If the node lacks a save file, create one from the current game state.
@@ -703,6 +744,18 @@ class MCTSAgent:
             if rollout_state is not None:
                 self._save_current_frame(rollout_state.screen_buffer)
 
+            velocity_x = self.current_game.get_game_variable(
+                vizdoom.GameVariable.VELOCITY_X
+            )
+            velocity_y = self.current_game.get_game_variable(
+                vizdoom.GameVariable.VELOCITY_Y
+            )
+             # Override velocity for testing
+            print("velocity_x: {}, velocity_y: {}".format(velocity_x, velocity_y))
+
+            self.current_game.send_game_command(f"+jump") # Override velocity
+
+
         # Evaluate outcome
         end_health = self.current_game.get_game_variable(
             vizdoom.GameVariable.HEALTH
@@ -730,17 +783,21 @@ class MCTSAgent:
         except Exception:
             logging.exception("_rollout: failed to restore node save %s after rollout", node.save_path)
 
+        self._record_benchmark("rollout", time.perf_counter() - timing_start)
         return value
 
     def _backpropagate(self, node: MCTSNode, value: float) -> None:
         """Backpropagation: update statistics up the tree."""
+        timing_start = time.perf_counter()
         current = node
         while current is not None:
             current.update(value)
             current = current.parent
+        self._record_benchmark("backpropagate", time.perf_counter() - timing_start)
 
     def run_simulation(self) -> None:
         """Run one MCTS simulation (select, expand, rollout, backprop)."""
+        timing_start = time.perf_counter()
         if self.root is None:
             raise ValueError("Root node not initialized. Call initialize_root() first.")
 
@@ -748,7 +805,9 @@ class MCTSAgent:
         # not leak into live gameplay.
         try:
             # Make sure to restore to root state at start of simulation
+            restore_start = time.perf_counter()
             self._copy_state_for_expansion(self.root)
+            self._record_benchmark("copy_state", time.perf_counter() - restore_start)
             if self.save_images:
                 self.image_save_index = 0
 
@@ -768,7 +827,10 @@ class MCTSAgent:
             # Backpropagation
             self._backpropagate(node, value)
         finally:
+            restore_end_start = time.perf_counter()
             self._copy_state_for_expansion(self.root)
+            self._record_benchmark("copy_state", time.perf_counter() - restore_end_start)
+            self._record_benchmark("run_simulation", time.perf_counter() - timing_start)
 
     def _run_single_leaf_eval(self, leaf_info: Tuple[MCTSNode, str, int]) -> Tuple[MCTSNode, float]:
         """Run a single leaf evaluation for batching.
@@ -833,6 +895,7 @@ class MCTSAgent:
 
     def initialize_root(self) -> None:
         """Create root node from current game state with model priors."""
+        timing_start = time.perf_counter()
         game_state, save_path = self._create_state_from_game()
 
         # Evaluate model priors for root state
@@ -847,38 +910,57 @@ class MCTSAgent:
             num_actions=self.num_actions,
             model_priors=model_priors,
         )
+        self._record_benchmark("initialize_root", time.perf_counter() - timing_start)
 
-    def get_action(self) -> Tuple[str, List[int], int]:
+    def get_action(self) -> Tuple[str, List[int], int, Dict[str, Dict[str, float]]]:
         """Run MCTS and return the best action.
 
         Returns:
-            Tuple of (action_name, button_vector, action_index)
+            Tuple of (action_name, button_vector, action_index, benchmark_times)
         """
-        if self.root is None:
-            self.initialize_root()
+        benchmark_times: Dict[str, Dict[str, float]] = {
+            "initialize_root": {"total_ms": 0.0, "count": 0.0},
+            "run_simulation": {"total_ms": 0.0, "count": 0.0},
+            "copy_state": {"total_ms": 0.0, "count": 0.0},
+            "select": {"total_ms": 0.0, "count": 0.0},
+            "expand": {"total_ms": 0.0, "count": 0.0},
+            "rollout": {"total_ms": 0.0, "count": 0.0},
+            "backpropagate": {"total_ms": 0.0, "count": 0.0},
+        }
+        self._benchmark_sink = benchmark_times
 
-        # Run simulations (batched if batch_size > 1)
-        if self.batch_size > 1:
-            self.run_simulations_batched()
-        else:
-            for _ in range(self.num_simulations):
-                self.run_simulation()
+        try:
+            if self.root is None:
+                self.initialize_root()
 
-        # Select best action (most visits)
-        best_action = 0
-        best_visits = -1
-        for action, child in self.root.children.items():
-            if child.visits > best_visits:
-                best_visits = child.visits
-                best_action = action
+            # Run simulations (batched if batch_size > 1)
+            if self.batch_size > 1:
+                self.run_simulations_batched()
+            else:
+                for _ in range(self.num_simulations):
+                    self.run_simulation()
 
-        action_name = self.action_names[best_action]
-        buttons = self.action_to_buttons[action_name]
+            # Select best action (most visits)
+            best_action = 0
+            best_visits = -1
+            for action, child in self.root.children.items():
+                if child.visits > best_visits:
+                    best_visits = child.visits
+                    best_action = action
 
-        # Ensure caller executes chosen action from real/root game state.
-        self._copy_state_for_expansion(self.root)
+            action_name = self.action_names[best_action]
+            buttons = self.action_to_buttons[action_name]
 
-        return action_name, buttons, best_action
+            # Ensure caller executes chosen action from real/root game state.
+            self._copy_state_for_expansion(self.root)
+
+            for entry in benchmark_times.values():
+                count = int(entry["count"])
+                entry["avg_ms"] = entry["total_ms"] / count if count else 0.0
+
+            return action_name, buttons, best_action, benchmark_times
+        finally:
+            self._benchmark_sink = None
 
     def advance_root(self, action_taken: int) -> None:
         """Advance tree by making the selected action the new root.
