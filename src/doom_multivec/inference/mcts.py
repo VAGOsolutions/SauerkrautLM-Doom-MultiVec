@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from pathlib import Path
+from doom_multivec.inference.llm_eval import query_llm_with_frames, _extract_text_from_response
 
 
 def _save_image_index_frame(frame: Optional[np.ndarray], image_index: int) -> Optional[str]:
@@ -76,6 +77,8 @@ class MCTSNode:
         action_taken: Action index that led to this node from parent
         num_actions: Number of possible actions
         model_priors: Optional array of action probabilities from model (for selection)
+        use_llm_eval: Whether to use LLM evaluation for this node (default: False)
+        sampling_rate: How often to pass frames for LLM eval (e.g., 1 = every frame, 2 = every 2nd frame) (default: 1)
     """
 
     def __init__(
@@ -86,6 +89,8 @@ class MCTSNode:
         action_taken: Optional[int] = None,
         num_actions: int = 4,
         model_priors: Optional[np.ndarray] = None,
+        use_llm_eval: bool = False,
+        sampling_rate: int = 1,
     ):
         self.state = state
         self.action_sequence = action_sequence  # Actions taken from root to reach this node
@@ -93,6 +98,8 @@ class MCTSNode:
         self.action_taken = action_taken
         self.num_actions = num_actions
         self.model_priors = model_priors
+        self.use_llm_eval = use_llm_eval  # Toggle for LLM evaluation
+        self.sampling_rate = sampling_rate  # Frame sampling rate for LLM eval
 
         # Tree structure
         self.children: Dict[int, 'MCTSNode'] = {}
@@ -301,6 +308,13 @@ class MCTSAgent:
         use_composite_moves: bool = True,
         composite_logit_weights: Optional[List[float]] = None,
         save_images: bool = False,
+        use_llm_eval: bool = False,
+        llm_sampling_rate: int = 4,
+        llm_api_key: Optional[str] = None,
+        llm_prompt: Optional[str] = None,
+        llm_model: str = "api-gemma-4-26b",
+        llm_max_tokens: int = 2048,
+        llm_verbose: bool = False,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -317,6 +331,28 @@ class MCTSAgent:
         self.save_images = save_images
         self.use_composite_moves = use_composite_moves
         self.composite_logit_weights = composite_logit_weights or [1.0, 1.0, 1.0, 1.0]
+        self.use_llm_eval = use_llm_eval  # Toggle for LLM eval
+        self.llm_sampling_rate = llm_sampling_rate  # Frame sampling rate for LLM eval
+        self.llm_api_key = llm_api_key  # API key for LLM calls
+        self.llm_prompt = llm_prompt  # Prompt for LLM evaluation
+        self.llm_model = llm_model  # LLM model name
+        self.llm_max_tokens = llm_max_tokens  # Max tokens for LLM response
+        self.llm_verbose = llm_verbose  # Whether to print LLM responses
+        
+        # Load prompt from rubric.txt if not provided
+        if self.llm_prompt is None:
+            rubric_path = Path(__file__).resolve().parent / "rubric.txt"
+            if rubric_path.exists():
+                try:
+                    with open(rubric_path, 'r') as f:
+                        self.llm_prompt = f.read().strip()
+                    if self.llm_prompt:
+                        logging.debug(f"Loaded LLM prompt from {rubric_path}")
+                except Exception as e:
+                    logging.warning(f"Failed to load rubric from {rubric_path}: {e}")
+                    self.llm_prompt = "Evaluate the gameplay shown in these frames. Is the agent performing well? Rate from 0.0 (bad) to 1.0 (good)."
+            else:
+                self.llm_prompt = "Evaluate the gameplay shown in these frames. Is the agent performing well? Rate from 0.0 (bad) to 1.0 (good)."
         
         # Build action mappings based on composite moves toggle
         self._build_action_mappings()
@@ -331,6 +367,7 @@ class MCTSAgent:
         self._root_game_state: Optional[GameState] = None
         self._root_save_path: Optional[str] = None  # Path to saved root state
         self._benchmark_sink: Optional[Dict[str, Dict[str, float]]] = None
+        self._llm_eval_frames: List[np.ndarray] = []  # Collect frames for LLM eval
 
     def _record_benchmark(self, key: str, elapsed_seconds: float) -> None:
         if self._benchmark_sink is None:
@@ -373,6 +410,7 @@ class MCTSAgent:
             self.root._recursive_clear()
         self.root = None
         self._root_game_state = None
+        self._llm_eval_frames = []  # Clear collected frames
         # Clean up start save file
         if self._root_save_path is not None and os.path.exists(self._root_save_path):
             try:
@@ -456,6 +494,8 @@ class MCTSAgent:
             logging.exception(f"Failed to load start save at {self._root_save_path}")
             return
         
+        self.current_game.make_action([0, 0, 0, 0], 1) # Only need to reset buttons once at the start, not after every action
+        
         # Replay each action in the sequence
         for action_idx in action_sequence:
             if self.current_game.is_episode_finished():
@@ -463,7 +503,7 @@ class MCTSAgent:
             
             action_name = self.action_names[action_idx]
             buttons = self.action_to_buttons[action_name]
-            self.current_game.make_action([0, 0, 0, 0], 1)  # Neutral action
+            #self.current_game.make_action([0, 0, 0, 0], 1) # Reset buttons 
             self.current_game.make_action(buttons, 4)  # Actual action
     
     def _load_root_state(self) -> None:
@@ -687,6 +727,8 @@ class MCTSAgent:
             action_taken=action,
             num_actions=self.num_actions,
             model_priors=child_priors,
+            use_llm_eval=self.use_llm_eval,
+            sampling_rate=self.llm_sampling_rate,
         )
 
         node.children[action] = child
@@ -700,6 +742,9 @@ class MCTSAgent:
         Lose: Health OR armor decreased with no game reward increase
         
         Assumes the game is already positioned at node's state (from prior _expand call).
+        
+        If use_llm_eval is enabled, collects frames at sampling_rate intervals and queries
+        LLM for additional evaluation signal.
 
         Returns:
             1.0 for win, 0.0 for lose, 0.5 for neutral
@@ -718,8 +763,11 @@ class MCTSAgent:
             vizdoom.GameVariable.KILLCOUNT
         )
 
+        # Collect frames for LLM eval if enabled
+        llm_frames = []
+
         # Simulate actions guided by model
-        for _ in range(self.rollout_depth):
+        for frame_idx in range(self.rollout_depth):
             if self.current_game.is_episode_finished():
                 break
 
@@ -733,6 +781,10 @@ class MCTSAgent:
             rollout_state = self.current_game.get_state()
             if rollout_state is not None:
                 self._save_current_frame(rollout_state.screen_buffer)
+                
+                # Collect frames for LLM eval based on sampling rate
+                if node.use_llm_eval and (frame_idx % node.sampling_rate == 0):
+                    llm_frames.append(np.array(rollout_state.screen_buffer, copy=True))
             
         # Evaluate outcome
         end_health = self.current_game.get_game_variable(
@@ -751,8 +803,69 @@ class MCTSAgent:
 
         value = kill_reward + 2 * health_reward + 2 * armor_reward
 
+        # Call LLM eval if enabled
+        if node.use_llm_eval and llm_frames:
+            llm_value = self._evaluate_with_llm(llm_frames, node)
+            # Blend LLM eval with model-based value (can be adjusted based on preference)
+            value = 0.7 * value + 0.3 * llm_value
+
         self._record_benchmark("rollout", time.perf_counter() - timing_start)
         return value
+
+    def _evaluate_with_llm(self, frames: List[np.ndarray], node: MCTSNode) -> float:
+        """Evaluate frames using the LLM via query_llm_with_frames.
+        
+        Args:
+            frames: List of numpy arrays representing frames collected during rollout
+            node: MCTSNode being evaluated (for context)
+            
+        Returns:
+            Float value between 0.0 and 1.0 representing LLM evaluation score
+        """
+        if not self.use_llm_eval or not frames:
+            return 0.5
+        
+        try:
+            # Call the LLM with frames and prompt
+            resp_json = query_llm_with_frames(
+                frames=frames,
+                prompt=self.llm_prompt,
+                api_key=self.llm_api_key,
+                model=self.llm_model,
+                max_tokens=self.llm_max_tokens,
+            )
+            
+            # Extract text response
+            text_response = _extract_text_from_response(resp_json)
+            
+            # Ensure it's a string
+            if not isinstance(text_response, str):
+                text_response = str(text_response)
+
+            if self.llm_verbose:
+                if text_response is None:
+                    print("Unable to parse score from LLM response")
+                    print("Received response:", resp_json)
+                else:
+                    print(f"LLM response: {text_response}")
+            
+            # Try to parse score from response
+            # Look for a number between 0 and 1 in the response
+            import re
+            numbers = re.findall(r'0\.\d+|1\.0', text_response)
+            if numbers:
+                score = float(numbers[0])
+                return max(0.0, min(1.0, score))
+            
+            # Fallback: if response looks positive, score higher
+            positive_words = ['good', 'excellent', 'well', 'performing', 'strong', 'positive']
+            if any(word in text_response.lower() for word in positive_words):
+                return 0.7
+            
+            return 0.5
+        except Exception as e:
+            logging.error(f"LLM eval error: {e}", exc_info=True)
+            return 0.5
 
     def _backpropagate(self, node: MCTSNode, value: float) -> None:
         """Backpropagation: update statistics up the tree."""
@@ -828,6 +941,8 @@ class MCTSAgent:
             action_taken=action,
             num_actions=self.num_actions,
             model_priors=child_priors,
+            use_llm_eval=self.use_llm_eval,
+            sampling_rate=self.llm_sampling_rate,
         )
         node.children[action] = child
 
@@ -881,6 +996,8 @@ class MCTSAgent:
             action_taken=None,
             num_actions=self.num_actions,
             model_priors=model_priors,
+            use_llm_eval=self.use_llm_eval,
+            sampling_rate=self.llm_sampling_rate,
         )
         self._record_benchmark("initialize_root", time.perf_counter() - timing_start)
 
@@ -924,7 +1041,8 @@ class MCTSAgent:
             buttons = self.action_to_buttons[action_name]
 
             # Ensure caller executes chosen action from real/root game state.
-            self._copy_state_for_expansion(self.root)
+            # Not necessary to load root state here since we always end simulations with root state loaded,
+            # self._copy_state_for_expansion(self.root)
 
             for entry in benchmark_times.values():
                 count = int(entry["count"])

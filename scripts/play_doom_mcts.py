@@ -471,6 +471,18 @@ def main():
                         help='Temperature for prior distribution modification (default: 0.1)')
     parser.add_argument('--time', action='store_true',
                         help='Print detailed MCTS timing breakdown')
+    parser.add_argument('--use-llm-eval', action='store_true',
+                        help='Enable LLM evaluation of rollouts')
+    parser.add_argument('--llm-sampling-rate', type=int, default=4,
+                        help='Frame sampling rate for LLM eval (e.g., 1 = every frame, 2 = every 2nd frame) (default: 1)')
+    parser.add_argument('--llm-api-key', type=str, default=None,
+                        help='API key for Triton LLM endpoint (defaults to LITELLM_API_KEY env var)')
+    parser.add_argument('--llm-prompt', type=str, default=None,
+                        help='Prompt for LLM evaluation')
+    parser.add_argument('--llm-model', type=str, default='api-gemma-4-26b',
+                        help='LLM model name to use (default: api-gemma-4-26b)')
+    parser.add_argument('--llm-verbose', action='store_true',
+                        help='Print LLM responses during evaluation')
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -485,6 +497,8 @@ def main():
     print(f"\nStarting DOOM ({args.scenario})...")
     print(f"MCTS config: {args.simulations} simulations, {args.depth} frame depth, c={args.c}, batch={args.batch_size}")
     print(f"Algorithm: {'UCB1' if args.use_ucb else 'PUCT'}, rollout_temperature={args.rollout_temperature}, prior_temperature={args.prior_temperature}")
+    if args.use_llm_eval:
+        print(f"LLM eval: ENABLED (sampling_rate={args.llm_sampling_rate}, model={args.llm_model})")
     if args.live:
         print("Mode: LIVE (continuous display, steps/minute)")
     if args.armed:
@@ -509,6 +523,12 @@ def main():
         prior_temperature=args.prior_temperature,
         use_composite_moves=True,
         composite_logit_weights=[50.0, 0.7, 0.8, 0.9],  # No additional weight on composite moves
+        use_llm_eval=args.use_llm_eval,
+        llm_sampling_rate=args.llm_sampling_rate,
+        llm_api_key=args.llm_api_key,
+        llm_prompt=args.llm_prompt,
+        llm_model=args.llm_model,
+        llm_verbose=args.llm_verbose,
     )
     agent.set_game(game)
 

@@ -1,0 +1,18 @@
+Given these screenshots of an agent playing DOOM, evaluate its performance.
+
+Use the following rubric to aid your judgement.
+
+Immediate Threat Management:
+- Good: The agent does not have any immediate threats.
+- Bad: The agent is in danger from an unaddressed threat.
+
+Location:
+- Good: The agent has lots of free space to move around.
+- Bad: The agent is stuck in a corner or against a wall.
+
+Long Term Planning:
+- Good: The agent is positioned to secure many future kills.
+- Bad: The agent has placed itself in an unfavorable position.
+
+After rating the model, provide a comprehensive score that evaluates the agent's performance, from 0.00 (bad) to 1.00 (good).
+

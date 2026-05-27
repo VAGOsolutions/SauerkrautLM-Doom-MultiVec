@@ -1,0 +1,1 @@
+The rubric asks the LLM to rate the gameplay from 0.0 to 1.0.
